@@ -118,7 +118,7 @@ process comet {
   script:
   
   """
-  comet_rest2.py --fasta-file ${fasta}
+  comet_rest2.py ${fasta}
   """
   
 }

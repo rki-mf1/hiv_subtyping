@@ -1,204 +1,253 @@
 #!/usr/bin/env python3
-"""
-Submit a job to https://comet.lih.lu/index.php and capture the results
-in the same Python script.
-
-Supports:
-- paste FASTA into the form
-- upload a FASTA file
-
-Tested as a generic form-submitter by discovering the form structure at runtime,
-so it does not hardcode fragile field names.
-"""
-
 from __future__ import annotations
 
 import argparse
+import io
+import re
 import sys
+import time
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, parse_qs
 
+import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
-import pandas as pd
+
+DEFAULT_COMET_URL = "https://comet.lih.lu/index.php?cat=hiv1"
 
 
-BASE_URL = "https://comet.lih.lu/index.php?cat=hiv1"  # switch cat=hiv2 or cat=hcv if needed
+class CometError(RuntimeError):
+    pass
 
 
-def pick_form(soup: BeautifulSoup, mode: str):
+def find_upload_form(html: str, base_url: str) -> tuple[str, str, dict[str, str], str]:
     """
-    Heuristically pick the correct form:
-    - paste mode: form containing a <textarea>
-    - upload mode: form containing <input type=file>
+    Discover the upload form dynamically.
+
+    Returns:
+        method, action_url, form_data, file_field_name
     """
+    soup = BeautifulSoup(html, "html.parser")
     forms = soup.find_all("form")
     if not forms:
-        raise RuntimeError("No forms found on page.")
+        raise CometError("No forms found on COMET page.")
 
-    if mode == "paste":
-        for form in forms:
-            if form.find("textarea") is not None:
-                return form
-    elif mode == "upload":
-        for form in forms:
-            if form.find("input", {"type": "file"}) is not None:
-                return form
-
-    raise RuntimeError(f"Could not find a suitable form for mode={mode!r}.")
-
-
-def build_payload(form, fasta_text: str | None):
-    """
-    Collect hidden/default inputs and populate the textarea/checkbox fields.
-    """
-    data: dict[str, str] = {}
-    files = None
-
-    # Copy hidden inputs and preserve default values where present
-    for inp in form.find_all("input"):
-        name = inp.get("name")
-        if not name:
+    for form in forms:
+        file_input = form.find("input", {"type": "file"})
+        if not file_input or not file_input.get("name"):
             continue
 
-        typ = (inp.get("type") or "text").lower()
-        value = inp.get("value", "")
+        method = (form.get("method") or "post").lower()
+        action_url = urljoin(base_url, form.get("action") or base_url)
 
-        if typ in {"hidden", "submit"}:
-            data[name] = value
+        form_data: dict[str, str] = {}
 
-    # Find and tick required confirmation checkbox(es)
-    for cb in form.find_all("input", {"type": "checkbox"}):
-        name = cb.get("name")
-        if name:
-            # Most PHP forms accept the checkbox value if checked; default to "on" if absent
-            data[name] = cb.get("value", "on")
+        for inp in form.find_all("input"):
+            name = inp.get("name")
+            if not name:
+                continue
 
-    # Fill textarea for paste mode
-    if fasta_text is not None:
-        textarea = form.find("textarea")
-        if textarea is None:
-            raise RuntimeError("Paste form has no textarea.")
-        textarea_name = textarea.get("name")
-        if not textarea_name:
-            raise RuntimeError("Textarea has no name attribute.")
-        data[textarea_name] = fasta_text
+            input_type = (inp.get("type") or "text").lower()
+            value = inp.get("value", "")
 
-    return data, files
+            if input_type == "hidden":
+                form_data[name] = value
+            elif input_type == "checkbox":
+                # Tick all checkboxes in the upload form, including the required
+                # non-commercial-use confirmation.
+                form_data[name] = value or "on"
+            elif input_type == "submit" and value:
+                # Keep one submit value if present.
+                form_data.setdefault(name, value)
 
+        return method, action_url, form_data, file_input["name"]
 
-def submit_paste(session: requests.Session, page_url: str, fasta_text: str, timeout: int = 120):
-    r = session.get(page_url, timeout=timeout)
-    r.raise_for_status()
-
-    soup = BeautifulSoup(r.text, "html.parser")
-    form = pick_form(soup, "paste")
-
-    method = (form.get("method") or "post").lower()
-    action = urljoin(page_url, form.get("action") or page_url)
-    data, _ = build_payload(form, fasta_text)
-
-    if method == "get":
-        resp = session.get(action, params=data, timeout=timeout)
-    else:
-        resp = session.post(action, data=data, timeout=timeout)
-
-    resp.raise_for_status()
-    return resp
+    raise CometError("Could not find an upload form with a file input.")
 
 
-def submit_upload(session: requests.Session, page_url: str, fasta_path: Path, timeout: int = 120):
-    r = session.get(page_url, timeout=timeout)
-    r.raise_for_status()
+def extract_job_id(text: str, response_url: str | None = None) -> str:
+    """
+    Extract job id from HTML or URL.
+    """
+    candidates = []
 
-    soup = BeautifulSoup(r.text, "html.parser")
-    form = pick_form(soup, "upload")
+    if response_url:
+        parsed = urlparse(response_url)
+        qs = parse_qs(parsed.query)
+        if "job" in qs and qs["job"]:
+            candidates.append(qs["job"][0])
 
-    method = (form.get("method") or "post").lower()
-    action = urljoin(page_url, form.get("action") or page_url)
+    patterns = [
+        r"[?&]job=([A-Za-z0-9_-]+)",
+        r'csv\.php\?job=([A-Za-z0-9_-]+)',
+        r'"job"\s*:\s*"([A-Za-z0-9_-]+)"',
+        r"'job'\s*:\s*'([A-Za-z0-9_-]+)'",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            candidates.append(m.group(1))
 
-    data, _ = build_payload(form, fasta_text=None)
+    for job_id in candidates:
+        if job_id:
+            return job_id
 
-    file_input = form.find("input", {"type": "file"})
-    if file_input is None or not file_input.get("name"):
-        raise RuntimeError("Upload form has no usable file input.")
+    raise CometError("Could not extract COMET job ID from submission response.")
 
-    file_field = file_input["name"]
+
+def looks_like_csv(text: str) -> bool:
+    """
+    Heuristic: ready CSV should contain at least one non-empty line with commas/semicolons/tabs.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return False
+
+    lines = [line for line in stripped.splitlines() if line.strip()]
+    if not lines:
+        return False
+
+    head = "\n".join(lines[:5]).lower()
+    if "error" in head and "job" in head:
+        return False
+    if "not found" in head or "invalid" in head:
+        return False
+    if "," in lines[0] or ";" in lines[0] or "\t" in lines[0]:
+        return True
+
+    # Sometimes CSV-like output may only show delimiter after the first line
+    return any(("," in line or ";" in line or "\t" in line) for line in lines[:5])
+
+
+def fetch_csv_when_ready(
+    session: requests.Session,
+    csv_url: str,
+    timeout_seconds: int = 300,
+    poll_interval_seconds: float = 3.0,
+) -> str:
+    """
+    Poll until CSV becomes available or timeout is reached.
+    """
+    deadline = time.time() + timeout_seconds
+    last_status = None
+    last_body = ""
+
+    while time.time() < deadline:
+        try:
+            resp = session.get(csv_url, timeout=60)
+            last_status = resp.status_code
+            last_body = resp.text
+
+            if resp.ok and looks_like_csv(resp.text):
+                return resp.text
+
+        except requests.RequestException as e:
+            last_body = f"{type(e).__name__}: {e}"
+
+        time.sleep(poll_interval_seconds)
+
+    raise CometError(
+        f"Timed out waiting for CSV.\n"
+        f"URL: {csv_url}\n"
+        f"Last HTTP status: {last_status}\n"
+        f"Last response excerpt: {last_body[:500]!r}"
+    )
+
+
+def read_csv_to_dataframe(csv_text: str) -> pd.DataFrame:
+    """
+    Load CSV robustly, trying common delimiters.
+    """
+    for sep in [",", ";", "\t"]:
+        try:
+            df = pd.read_csv(io.StringIO(csv_text), sep=sep)
+            if df.shape[1] >= 2:
+                return df
+        except Exception:
+            pass
+
+    # Final fallback: let pandas sniff with python engine
+    try:
+        return pd.read_csv(io.StringIO(csv_text), sep=None, engine="python")
+    except Exception as e:
+        raise CometError(f"Downloaded content does not parse as CSV: {e}") from e
+
+
+def submit_one_multifasta(
+    fasta_path: Path,
+    comet_url: str = DEFAULT_COMET_URL,
+    wait_timeout: int = 300,
+    poll_interval: float = 3.0,
+) -> tuple[str, Path, pd.DataFrame]:
+    """
+    Submit exactly one multi-FASTA file, wait for CSV, save it, and return DataFrame.
+    """
+    if not fasta_path.exists():
+        raise FileNotFoundError(f"Input file not found: {fasta_path}")
+    if not fasta_path.is_file():
+        raise CometError(f"Input path is not a file: {fasta_path}")
+
+    out_csv = fasta_path.with_suffix(fasta_path.suffix + ".comet.csv")
+
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Python requests",
+        }
+    )
+
+    landing = session.get(comet_url, timeout=60)
+    landing.raise_for_status()
+
+    method, action_url, form_data, file_field_name = find_upload_form(
+        landing.text, comet_url
+    )
+
+    if method != "post":
+        raise CometError(f"Unexpected upload form method: {method!r}")
 
     with fasta_path.open("rb") as fh:
         files = {
-            file_field: (fasta_path.name, fh, "application/octet-stream"),
+            file_field_name: (
+                fasta_path.name,
+                fh,
+                "application/octet-stream",
+            )
         }
-        if method == "get":
-            raise RuntimeError("Upload form unexpectedly uses GET.")
-        resp = session.post(action, data=data, files=files, timeout=timeout)
+        submit_resp = session.post(action_url, data=form_data, files=files, timeout=120)
 
-    resp.raise_for_status()
-    return resp
+    submit_resp.raise_for_status()
 
+    job_id = extract_job_id(submit_resp.text, submit_resp.url)
+    csv_url = f"https://comet.lih.lu/csv.php?job={job_id}"
 
-def extract_results(html: str) -> str:
-    """
-    Best-effort extraction:
-    - keep tables
-    - keep <pre>
-    - otherwise return visible text
-    """
-    soup = BeautifulSoup(html, "html.parser")
+    csv_text = fetch_csv_when_ready(
+        session=session,
+        csv_url=csv_url,
+        timeout_seconds=wait_timeout,
+        poll_interval_seconds=poll_interval,
+    )
 
-    chunks = []
+    out_csv.write_text(csv_text, encoding="utf-8")
+    df = read_csv_to_dataframe(csv_text)   
 
-    # Tables often hold COMET output
-    for table in soup.find_all("table"):
-        rows = []
-        for tr in table.find_all("tr"):
-            cells = [td.get_text(" ", strip=True) for td in tr.find_all(["th", "td"])]
-            if cells:
-                rows.append("\t".join(cells))
-        if rows:
-            chunks.append("\n".join(rows))
-
-    # Preformatted output
-    for pre in soup.find_all("pre"):
-        txt = pre.get_text("\n", strip=True)
-        if txt:
-            chunks.append(txt)
-
-    if chunks:
-        return "\n\n".join(chunks)
-
-    # Fallback: visible body text
-    body = soup.get_text("\n", strip=True)
-    return body
+    return job_id, out_csv, df
 
 
-def format_hivtyper(text: str, infilename: str):
+def format_hivtyper(df: pd.DataFrame, infilename: str):
     name1 = infilename.rsplit("/")[-1] # gives a file name.fasta
     name2 = name1.split("_")[1] # gives a middle part after splitting by "_"
     name3 = name1.rsplit(".")[-2] # gives a file name (cuts .fasta)
-
-    # skip first lines containing the version change info
-    # write the rest to a .csv file (it is separated by tab, but we will read it with pandas and write it again with comma separation)
-    with open("comet_" + name3 + ".csv", "w") as f:
-        dataline = False
-        for line in text.splitlines():
-            if line == "name	virus	subtype	support (1)":
-                dataline = True
-            if dataline:
-                f.write(line + "\n")
-
-    # Read .csv (it is separated by tab)
-    df = pd.read_csv("comet_" + name3 + ".csv", sep="\t")
 
     # Rename some columns (as done for stanford df)
     df.rename(columns = {"name":"SequenceName", "subtype": "Comet_" + name2 + "_Subtype"}, inplace = True)
 
     # Add to the "Comment" column bootstrap support info
-    df["Comet_" + name2 + "_Comment"] = df["support (1)"].astype(str)
+    df["Comet_" + name2 + "_Comment"] = df["bootstrap support"].astype(str)
 
     # Delete undesired columns
-    df.drop(columns=["virus", "support (1)"], axis = 1,  inplace = True)
+    df.drop(columns=["virus", "bootstrap support"], axis = 1,  inplace = True)
 
     # Replace some patterns so they look Stanford-like (add CRF)
     df["Comet_" + name2 + "_Subtype"] = df["Comet_" + name2 + "_Subtype"].replace(r"^(\w{2})_(\D)(\d?)(\w)(\w{0,1}?)(\d?)$", r"CRF\1_\2\4\5", regex=True)
@@ -242,43 +291,54 @@ def format_hivtyper(text: str, infilename: str):
     # Prepare a clean .csv file
     df.to_csv("comet_" + name3 + ".csv", sep=",", index=False, encoding="utf-8")
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--url", default=BASE_URL, help="COMET URL")
-    ap.add_argument("--fasta-file", type=Path, required=True, help="Upload this FASTA file")
-    ap.add_argument("--save-html", type=Path, default=Path("comet_result.html"))
-    ap.add_argument("--save-text", type=Path, default=Path("comet_result.txt"))
-    args = ap.parse_args()
-
-    session = requests.Session()
-    session.headers.update(
-        {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Python requests",
-        }
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Submit exactly one multi-FASTA file to COMET, wait for CSV, save it, and create a pandas DataFrame."
+    )
+    parser.add_argument(
+        "multifasta",
+        type=Path,
+        help="Path to one multi-FASTA file (.fa/.fasta/.gz also works if COMET accepts it).",
+    )
+    parser.add_argument(
+        "--comet-url",
+        default=DEFAULT_COMET_URL,
+        help="COMET endpoint, e.g. https://comet.lih.lu/index.php?cat=hiv1",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=300,
+        help="Maximum seconds to wait for the CSV.",
+    )
+    parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=5.0,
+        help="Polling interval in seconds.",
     )
 
+    args = parser.parse_args()
+
     try:
-        resp = submit_upload(session, args.url, args.fasta_file)
+        job_id, csv_path, df = submit_one_multifasta(
+            fasta_path=args.multifasta,
+            comet_url=args.comet_url,
+            wait_timeout=args.timeout,
+            poll_interval=args.poll_interval,
+        )
+        format_hivtyper(df, args.multifasta.name)
 
-        args.save_html.write_text(resp.text, encoding="utf-8")
-        parsed = extract_results(resp.text)
-        args.save_text.write_text(parsed, encoding="utf-8")
-        format_hivtyper(parsed, args.fasta_file.name)
+        print(f"COMET job_id: {job_id}")
+        print(f"CSV saved to: {csv_path}")
+        print(f"DataFrame shape: {df.shape}")
+        print(df.head().to_string(index=False))
+        return 0
 
-        print(f"Saved raw HTML to: {args.save_html}")
-        print(f"Saved parsed text to: {args.save_text}")
-        print("\n=== Parsed result preview ===\n")
-        print(parsed[:4000])
-
-    except requests.HTTPError as e:
-        print(f"HTTP error: {e}", file=sys.stderr)
-        if e.response is not None:
-            print(e.response.text[:2000], file=sys.stderr)
-        sys.exit(1)
     except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(2)
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
