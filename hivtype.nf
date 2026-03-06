@@ -118,7 +118,7 @@ process comet {
   script:
   
   """
-  comet_rest.py ${fasta} comet_${fasta.getSimpleName()}.csv
+  comet_rest2.py --fasta-file ${fasta}
   """
   
 }

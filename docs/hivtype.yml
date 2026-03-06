@@ -21,3 +21,4 @@ dependencies:
   - pillow = 9.2.0
   - sierrapy = 0.4.3
   - regex = 2024.11.6
+  - bs4 = 4.14.3
